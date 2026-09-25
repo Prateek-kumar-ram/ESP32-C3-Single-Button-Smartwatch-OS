@@ -1,0 +1,704 @@
+#include <Arduino.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <time.h>
+#include <sys/time.h>
+#include <FS.h>
+#include <LittleFS.h>
+
+#define BUTTON_PIN        4    
+#define BATTERY_ADC_PIN   1    
+#define OLED_SDA          8    
+#define OLED_SCL          9    
+
+// U8G2_R2 rotates the display 180 degrees (upside down)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+
+const char* myName  = "Prateek Kumar Ram";
+const char* myPhone = "+91-9340354557";
+const char* myInsta = "@insane_broooo";
+
+// 10 Total Screens
+enum ScreenState { SCREEN_HOME, SCREEN_DATE_BATT, SCREEN_FITNESS, SCREEN_PERSONAL_INFO, SCREEN_STATUS, SCREEN_WEATHER, SCREEN_GAME, SCREEN_COIN, SCREEN_STOPWATCH, SCREEN_TEXT };
+
+RTC_DATA_ATTR ScreenState currentScreen = SCREEN_HOME;
+RTC_DATA_ATTR int currentTemp = 34, highTemp = 39, lowTemp = 28; 
+RTC_DATA_ATTR int displayedBatteryPct = -1; 
+RTC_DATA_ATTR int fakeSteps = 0; 
+
+Preferences prefs;
+WebServer server(80);
+
+bool isAODEnabled = false;
+bool isWiFiActive = false;
+int maxBrightness = 255; 
+int aodBrightness = 1; 
+int currentBrightness = 255; 
+int displayTimeoutMs = 10000; 
+unsigned long lastActivityTime = 0;
+bool isScreenDimmed = false;
+
+unsigned long buttonPressTime = 0;
+unsigned long lastButtonReleaseTime = 0;
+bool buttonHeld = false;
+bool longPressHandled = false; 
+bool ignoreNextRelease = false; 
+bool pendingClick = false;
+int clickCount = 0;
+
+bool wifiShutdownRequested = false;
+unsigned long wifiEmptyStartTime = 0; 
+
+bool isEditingAOD = false;
+bool showDoneMessage = false;
+unsigned long doneMessageTime = 0;
+
+// App 1: Dino Game
+bool gameActive = false;
+float dinoY = 36, dinoVy = 0, gravity = 0.6, jumpStrength = -4.5;
+int cactusX = 128, cactusHeight = 10, score = 0, highScore = 0;
+bool gameOver = false;
+
+// App 2: Coin Toss
+bool coinActive = false;
+bool isFlipping = false;
+bool showResult = false;
+unsigned long flipStartTime = 0;
+int flipResult = 0; 
+
+// App 3: Stopwatch
+bool swActive = false;
+bool swRunning = false;
+unsigned long swStartTime = 0;
+unsigned long swElapsedTime = 0;
+
+// App 4: Text Vault
+bool textActive = false;
+String textViewerContent[3] = {"", "", ""};
+int currentTextLine = 0;
+unsigned long lastTextScrollTime = 0;
+
+char drawBuffer[64];
+const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+const char* htmlDashboard = R"rawliteral(
+<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
+<style>
+body{font-family:sans-serif; background:#121212; color:#E0E0E0; text-align:center; padding:15px;}
+.card{background:#1E1E1E; padding:20px; border-radius:10px; margin:15px auto; max-width:400px; text-align:left; border:1px solid #333;}
+h2, h3{color:#00ADB5; margin-top:0;}
+input[type=number], input[type=range], select{width:100%; padding:10px; margin:8px 0; background:#2D2D2D; border:none; color:#fff; border-radius:5px; box-sizing:border-box;}
+.btn{background:#00ADB5; color:#fff; border:none; padding:12px; width:100%; border-radius:5px; font-weight:bold; cursor:pointer; margin-top:10px;}
+.btn-danger{background:#FF4C6A;}
+.status{color:#00FF00; font-size:12px; text-align:center; margin-top:10px;}
+.telemetry{background:#2D2D2D; color:#00ADB5; padding:10px; border-radius:5px; font-weight:bold; text-align:center; margin-bottom:15px;}
+.p-bar{background:#2D2D2D; width:100%; height:15px; border-radius:5px; display:none; margin-top:10px;}
+.p-fill{background:#00ADB5; width:0%; height:100%; border-radius:5px;}
+</style></head><body>
+<h2>C3 Watch Portal</h2>
+<div id='timeStat' class='status'>Syncing time from phone...</div>
+<div class='telemetry' id='watchStats'>Battery: --% | Core Temp: -- &deg;C</div>
+
+<div class='card'><h3>1. Text Vault Upload</h3>
+<input type='file' id='fileInput'>
+<div class='p-bar' id='pBar'><div class='p-fill' id='pFill'></div></div>
+<button class='btn' onclick='uploadFile()'>Upload to Watch</button></div>
+
+<div class='card'><h3>2. Watch Settings</h3>
+<form action='/save' method='POST'>
+<label>Always-On Display (AOD):</label><br>
+<select name='aod'>
+  <option value='0'>OFF (Deep Sleep - Max Battery)</option>
+  <option value='1'>ON (Dim Clock - Low Battery)</option>
+</select><br>
+<label>Active Brightness Level:</label> <input type='range' name='bright' min='1' max='255' value='255'>
+<label>AOD Brightness Level:</label> <input type='range' name='aodbright' min='1' max='255' value='1'>
+<label>Screen Timeout (Seconds):</label> <input type='number' name='timeout' value='10'>
+<button type='submit' class='btn'>Save Settings</button>
+</form></div>
+
+<div class='card'><button class='btn btn-danger' onclick='fetch("/shutdown")'>SHUT DOWN PORTAL</button></div>
+
+<script>
+window.onload = function() {
+  let d = new Date();
+  fetch('/settime?h=' + d.getHours() + '&m=' + d.getMinutes() + '&s=' + d.getSeconds() + '&y=' + d.getFullYear() + '&mo=' + (d.getMonth()+1) + '&da=' + d.getDate() + '&wd=' + d.getDay())
+  .then(() => document.getElementById('timeStat').innerText = 'Time synced successfully!');
+  
+  setInterval(() => {
+    fetch('/status').then(r=>r.json()).then(d=>{
+      document.getElementById('watchStats').innerHTML = 'Battery: ' + d.batt + '% | Core Temp: ' + d.temp + ' &deg;C';
+    }).catch(e=>console.log(e));
+  }, 3000);
+};
+
+function uploadFile() {
+  let f = document.getElementById('fileInput').files[0];
+  if(!f) return alert('Select file!');
+  document.getElementById('pBar').style.display = 'block';
+  let xhr = new XMLHttpRequest(), fd = new FormData();
+  fd.append('update', f);
+  xhr.upload.onprogress = e => { if(e.lengthComputable) document.getElementById('pFill').style.width = (e.loaded/e.total*100)+'%'; };
+  xhr.onload = () => alert('Upload Complete!');
+  xhr.open('POST', '/upload', true); xhr.send(fd);
+}
+</script></body></html>
+)rawliteral";
+
+void setOLEDContrast(int value) {
+  currentBrightness = value; 
+  u8g2.setContrast(value);   
+}
+
+void loadPreferences() {
+  prefs.begin("watch", false);
+  isAODEnabled = prefs.getBool("aod", false); 
+  maxBrightness = prefs.getInt("bright", 255);
+  aodBrightness = prefs.getInt("aodbright", 1); 
+  displayTimeoutMs = prefs.getInt("timeout", 10) * 1000;
+  prefs.end();
+}
+
+int getBatteryPercentage() {
+  int rawADC = analogRead(BATTERY_ADC_PIN);
+  float voltage = (rawADC / 4095.0) * 3.3 * 2.0; 
+  int percent = map(voltage * 100, 330, 420, 0, 100);
+  percent = constrain(percent, 0, 100);
+
+  // Initialize instantly on first read to avoid -1 bug
+  if (displayedBatteryPct == -1) {
+    displayedBatteryPct = percent;
+  } else {
+    // Standard Anti-Fluctuation Logic (No charging screen overlay)
+    if (percent < displayedBatteryPct) displayedBatteryPct = percent; 
+    else if (percent >= displayedBatteryPct + 5) displayedBatteryPct = percent; 
+  }
+  return displayedBatteryPct;
+}
+
+void loadTextLines(int startLine = 0) {
+  File file = LittleFS.open("/notes.txt", "r");
+  if (!file) { textViewerContent[0] = "Vault Empty."; textViewerContent[1] = ""; textViewerContent[2] = ""; return; }
+  
+  int current = 0;
+  while (file.available() && current < startLine) { file.readStringUntil('\n'); current++; }
+
+  for (int i = 0; i < 3; i++) {
+    if (file.available()) {
+      textViewerContent[i] = file.readStringUntil('\n');
+      textViewerContent[i].replace("\r", ""); 
+    } else {
+      textViewerContent[i] = ""; 
+      // Loop back to start if we hit the end
+      if (i == 0) { currentTextLine = 0; file.seek(0); return loadTextLines(0); }
+    }
+  }
+  file.close();
+}
+
+void toggleWiFiPortal(bool enable) {
+  if (enable) {
+    isWiFiActive = true;
+    wifiEmptyStartTime = millis(); 
+    WiFi.mode(WIFI_AP); 
+    WiFi.softAP("C3_Mini_Watch", "12345678");
+    
+    server.on("/", [](){ server.send(200, "text/html", htmlDashboard); });
+    server.on("/shutdown", [](){ server.send(200); wifiShutdownRequested = true; });
+    server.on("/status", [](){
+      char json[64];
+      snprintf(json, sizeof(json), "{\"batt\":%d, \"temp\":%d}", getBatteryPercentage(), (int)temperatureRead());
+      server.send(200, "application/json", json);
+    });
+    
+    
+    server.on("/upload", HTTP_POST, [](){ server.send(200); loadTextLines(0); }, [](){
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) LittleFS.open("/notes.txt", "w").close();
+      else if (upload.status == UPLOAD_FILE_WRITE) { File f = LittleFS.open("/notes.txt", "a"); f.write(upload.buf, upload.currentSize); f.close(); }
+    });
+
+    server.on("/save", HTTP_POST, [](){
+      prefs.begin("watch", false);
+      prefs.putBool("aod", server.arg("aod") == "1");
+      prefs.putInt("bright", server.arg("bright").toInt());
+      prefs.putInt("aodbright", server.arg("aodbright").toInt());
+      prefs.putInt("timeout", server.arg("timeout").toInt());
+      prefs.end();
+      loadPreferences();
+      setOLEDContrast(maxBrightness);
+      isScreenDimmed = false;
+      server.send(200, "text/html", "<body style='background:#121212; color:white; text-align:center;'><h3>Saved!</h3><a href='/' style='color:#00ADB5;'>Go Back</a></body>");
+    });
+    server.on("/settime", [](){
+      struct tm t = {0};
+      t.tm_hour = server.arg("h").toInt(); t.tm_min = server.arg("m").toInt(); t.tm_sec = server.arg("s").toInt();
+      t.tm_year = server.arg("y").toInt() - 1900; t.tm_mon = server.arg("mo").toInt() - 1;
+      t.tm_mday = server.arg("da").toInt(); t.tm_wday = server.arg("wd").toInt();
+      struct timeval tv = { mktime(&t), 0 }; settimeofday(&tv, NULL);
+      server.send(200, "text/plain", "OK");
+    });
+    server.begin();
+  } else {
+    isWiFiActive = false;
+    server.stop();
+    WiFi.softAPdisconnect(true); 
+    WiFi.mode(WIFI_OFF);
+  }
+}
+
+void renderUI() {
+  u8g2.clearBuffer();
+  struct tm timeinfo; getLocalTime(&timeinfo); 
+  unsigned long ms = millis();
+
+  if (isWiFiActive) {
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.drawStr(5, 20, "Wi-Fi Server Active");
+    u8g2.drawStr(5, 40, "Network: C3_Mini_Watch");
+    u8g2.drawStr(5, 55, "IP: 192.168.4.1");
+    u8g2.sendBuffer();
+    return;
+  }
+
+  switch (currentScreen) {
+    case SCREEN_HOME: {
+      u8g2.setFont(u8g2_font_logisoso46_tn); 
+      char hrBuf[4], minBuf[4];
+      snprintf(hrBuf, sizeof(hrBuf), "%02d", timeinfo.tm_hour);
+      snprintf(minBuf, sizeof(minBuf), "%02d", timeinfo.tm_min);
+      u8g2.drawStr(-6, 58, hrBuf);
+      u8g2.drawStr(60, 58, minBuf);
+      if ((ms / 500) % 2 == 0) u8g2.drawStr(43, 54, ":");
+      break;
+    }
+
+    case SCREEN_DATE_BATT: {
+      int batt = getBatteryPercentage();
+      u8g2.drawFrame(98, 10, 24, 12); 
+      u8g2.drawBox(122, 13, 2, 6);    
+      u8g2.drawBox(100, 12, (batt * 20) / 100, 8); 
+      u8g2.setFont(u8g2_font_helvB10_tf);
+      snprintf(drawBuffer, sizeof(drawBuffer), "%d%%", batt);
+      u8g2.drawStr(10, 22, drawBuffer);
+      u8g2.setFont(u8g2_font_6x12_tf);
+      snprintf(drawBuffer, sizeof(drawBuffer), "%s, %02d/%02d/%04d", dayNames[timeinfo.tm_wday], timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+      int lineX = 10 + (ms / 20) % 100;
+      u8g2.drawStr(10, 45, drawBuffer);
+      u8g2.drawHLine(10, 48, 108);
+      u8g2.drawBox(lineX, 47, 10, 3);
+      break;
+    }
+
+    case SCREEN_FITNESS: {
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(5, 15, "FITNESS TRACKER");
+      u8g2.drawHLine(5, 18, 118);
+      u8g2.setFont(u8g2_font_helvB14_tf);
+      snprintf(drawBuffer, sizeof(drawBuffer), "%d", fakeSteps);
+      u8g2.drawStr(10, 40, drawBuffer);
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(10, 58, "Steps today");
+      u8g2.drawFrame(80, 28, 40, 12);
+      u8g2.drawBox(82, 30, (fakeSteps % 1000) * 36 / 1000, 8); 
+      break;
+    }
+
+    case SCREEN_PERSONAL_INFO: {
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(30, 15, "OWNER ID");
+      u8g2.drawRFrame(2, 22, 124, 40, 5);
+      u8g2.drawStr(8, 35, myName);
+      u8g2.drawStr(8, 47, myPhone);
+      u8g2.drawStr(8, 59, myInsta);
+      break;
+    }
+
+    case SCREEN_STATUS: {
+      if (showDoneMessage) {
+        u8g2.setFont(u8g2_font_helvB14_tf);
+        u8g2.drawStr(35, 40, "DONE");
+        if (ms - doneMessageTime > 1500) showDoneMessage = false;
+      } else if (isEditingAOD) {
+        u8g2.setFont(u8g2_font_6x12_tf);
+        u8g2.drawStr(5, 15, "[EDIT AOD SETTING]");
+        snprintf(drawBuffer, sizeof(drawBuffer), "> SET AOD: %s <", isAODEnabled ? "ON" : "OFF");
+        u8g2.drawStr(5, 40, drawBuffer);
+        u8g2.drawStr(5, 62, "Hold to Save");
+      } else {
+        u8g2.setFont(u8g2_font_6x12_tf);
+        u8g2.drawStr(5, 15, "SYSTEM TELEMETRY");
+        u8g2.drawHLine(5, 18, 118);
+        snprintf(drawBuffer, sizeof(drawBuffer), "Core Temp: %d C", (int)temperatureRead());
+        u8g2.drawStr(5, 32, drawBuffer);
+        snprintf(drawBuffer, sizeof(drawBuffer), "AOD Mode: %s", isAODEnabled ? "ON" : "OFF");
+        u8g2.drawStr(5, 48, drawBuffer);
+        int timeoutBar = map(ms - lastActivityTime, 0, displayTimeoutMs, 118, 0);
+        u8g2.drawBox(5, 60, constrain(timeoutBar, 0, 118), 2);
+      }
+      break;
+    }
+
+    case SCREEN_WEATHER: {
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(5, 15, "ENVIRONMENT");
+      u8g2.drawHLine(5, 18, 118);
+      int r = 7 + (ms / 200) % 3; 
+      u8g2.drawCircle(25, 42, r); 
+      u8g2.drawLine(25, 30, 25, 32); u8g2.drawLine(25, 52, 25, 54);
+      u8g2.drawLine(13, 42, 15, 42); u8g2.drawLine(35, 42, 37, 42);
+      u8g2.setFont(u8g2_font_helvB14_tf);
+      snprintf(drawBuffer, sizeof(drawBuffer), "%d C", currentTemp);
+      u8g2.drawStr(55, 38, drawBuffer);
+      u8g2.setFont(u8g2_font_5x8_tf);
+      snprintf(drawBuffer, sizeof(drawBuffer), "HI:%d LO:%d", highTemp, lowTemp);
+      u8g2.drawStr(55, 55, drawBuffer);
+      break;
+    }
+
+    case SCREEN_GAME: {
+      if (!gameActive) {
+        u8g2.setFont(u8g2_font_6x12_tf);
+        u8g2.drawStr(25, 20, "DINO JUMP");
+        u8g2.drawStr(15, 40, "[2x Click] Start");
+        u8g2.drawStr(15, 55, "[1x Click] Next");
+      } else {
+        u8g2.drawLine(0, 48, 128, 48); 
+        if (!gameOver) {
+          dinoVy += gravity; dinoY += dinoVy;
+          if (dinoY >= 38) { dinoY = 38; dinoVy = 0; } 
+          cactusX -= (3 + score / 10); 
+          if (cactusX < -8) { cactusX = 128; score++; cactusHeight = random(8, 18); }
+          if (cactusX < 18 && cactusX > 2 && dinoY > (48 - cactusHeight - 8)) { 
+            gameOver = true; if (score > highScore) highScore = score; 
+          }
+        }
+        u8g2.drawFrame(10, (int)dinoY, 8, 8);
+        u8g2.drawBox(14, (int)dinoY + 2, 2, 2); 
+        u8g2.drawBox(cactusX, 48 - cactusHeight, 6, cactusHeight);
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.setCursor(5, 10); u8g2.print("Scr:"); u8g2.print(score);
+        u8g2.setCursor(80, 10); u8g2.print("HI:"); u8g2.print(highScore);
+        if (gameOver) { u8g2.drawStr(35, 25, "GAME OVER"); u8g2.drawStr(5, 60, "[Click]=Retry  [Hold]=Exit"); } 
+        else { u8g2.drawStr(5, 60, "[Click]=Jump   [Hold]=Exit"); }
+        if (!gameOver) lastActivityTime = millis();
+      }
+      break;
+    }
+
+    case SCREEN_COIN: {
+      if (!coinActive) {
+        u8g2.setFont(u8g2_font_6x12_tf);
+        u8g2.drawStr(20, 20, "COIN FLIPPER");
+        u8g2.drawStr(15, 40, "[2x Click] Start");
+        u8g2.drawStr(15, 55, "[1x Click] Next");
+      } else {
+        if (isFlipping) {
+          // 3D Coin Flip Animation
+          int timeFlipping = ms - flipStartTime;
+          if (timeFlipping > 1500) { 
+            isFlipping = false; showResult = true; 
+            flipResult = random(0, 2); 
+          } else {
+            int h = abs(sin(timeFlipping / 80.0)) * 20; 
+            u8g2.drawEllipse(64, 30, 20, max(h, 1));
+            u8g2.setFont(u8g2_font_6x12_tf);
+            u8g2.drawStr(35, 60, "Flipping...");
+            lastActivityTime = ms;
+          }
+        } else if (showResult) {
+          u8g2.drawCircle(64, 30, 20);
+          u8g2.setFont(u8g2_font_helvB10_tf);
+          if (flipResult == 0) u8g2.drawStr(52, 35, "HEAD");
+          else u8g2.drawStr(54, 35, "TAIL");
+          u8g2.setFont(u8g2_font_5x7_tf);
+          u8g2.drawStr(15, 60, "[Click]=Flip again [Hold]=Exit");
+        } else {
+          u8g2.drawCircle(64, 30, 20);
+          u8g2.setFont(u8g2_font_6x12_tf);
+          u8g2.drawStr(58, 34, "?");
+          u8g2.setFont(u8g2_font_5x7_tf);
+          u8g2.drawStr(25, 60, "[Click] to Toss Coin");
+        }
+      }
+      break;
+    }
+
+    case SCREEN_STOPWATCH: {
+      if (!swActive) {
+        u8g2.setFont(u8g2_font_6x12_tf);
+        u8g2.drawStr(25, 20, "STOPWATCH");
+        u8g2.drawStr(15, 40, "[2x Click] Start");
+        u8g2.drawStr(15, 55, "[1x Click] Next");
+      } else {
+        unsigned long displayTime = swElapsedTime;
+        if (swRunning) {
+          displayTime += (ms - swStartTime);
+          lastActivityTime = ms; // Keep awake while running
+        }
+        
+        int msecs = (displayTime % 1000) / 10;
+        int secs = (displayTime / 1000) % 60;
+        int mins = (displayTime / 60000);
+        
+        u8g2.setFont(u8g2_font_logisoso24_tn);
+        snprintf(drawBuffer, sizeof(drawBuffer), "%02d:%02d", mins, secs);
+        u8g2.drawStr(10, 35, drawBuffer);
+        
+        u8g2.setFont(u8g2_font_helvB10_tf);
+        snprintf(drawBuffer, sizeof(drawBuffer), ".%02d", msecs);
+        u8g2.drawStr(90, 35, drawBuffer);
+
+        u8g2.setFont(u8g2_font_5x7_tf);
+        if (swRunning) u8g2.drawStr(15, 60, "[Click] Stop | [Hold] Exit");
+        else u8g2.drawStr(5, 60, "[Click] Start | [2x] Reset | [Hold] Exit");
+      }
+      break;
+    }
+
+    case SCREEN_TEXT: {
+      if (!textActive) {
+        u8g2.setFont(u8g2_font_6x12_tf);
+        u8g2.drawStr(25, 20, "TEXT VAULT");
+        u8g2.drawStr(15, 40, "[2x Click] Open");
+        u8g2.drawStr(15, 55, "[1x Click] Next");
+      } else {
+        u8g2.setFont(u8g2_font_5x7_tf); 
+        u8g2.drawStr(2, 10, "[SECURE TEXT VAULT]");
+        u8g2.drawStr(2, 26, textViewerContent[0].c_str());
+        u8g2.drawStr(2, 40, textViewerContent[1].c_str());
+        u8g2.drawStr(2, 54, textViewerContent[2].c_str());
+        
+        // Auto Scroll every 3 seconds
+        if (ms - lastTextScrollTime > 3000) {
+          currentTextLine++;
+          loadTextLines(currentTextLine);
+          lastTextScrollTime = ms;
+        }
+      }
+      break;
+    }
+  }
+  u8g2.sendBuffer();
+}
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  loadPreferences();
+  LittleFS.begin(true);
+  
+  u8g2.begin();
+  u8g2.setPowerSave(0); 
+  setOLEDContrast(maxBrightness);
+
+  struct tm timeinfo;
+  getLocalTime(&timeinfo, 100);
+  if (timeinfo.tm_year < 120) {
+    struct tm fakeTime = {0};
+    fakeTime.tm_hour = 12; fakeTime.tm_mday = 1; fakeTime.tm_year = 124; 
+    struct timeval tv = { mktime(&fakeTime), 0 };
+    settimeofday(&tv, NULL);
+  }
+
+  // Get raw battery voltage early for accurate random seeding
+  int rawADC = analogRead(BATTERY_ADC_PIN);
+  randomSeed(rawADC + micros());
+
+  // Force first battery read on boot to fix -1 bug
+  getBatteryPercentage();
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    fakeSteps += random(15, 45); 
+  }
+
+  esp_deep_sleep_enable_gpio_wakeup((1ULL << BUTTON_PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
+  lastActivityTime = millis();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (wifiShutdownRequested) {
+    wifiShutdownRequested = false;
+    toggleWiFiPortal(false);
+  }
+
+  if (isWiFiActive) {
+    server.handleClient();
+    if (WiFi.softAPgetStationNum() > 0) {
+      wifiEmptyStartTime = currentMillis; 
+    } else if (currentMillis - wifiEmptyStartTime > 60000) {
+      toggleWiFiPortal(false);
+      lastActivityTime = currentMillis; 
+    }
+  }
+
+  bool buttonState = !digitalRead(BUTTON_PIN);
+  
+  if (buttonState && !buttonHeld) {
+    buttonPressTime = currentMillis;
+    buttonHeld = true;
+    longPressHandled = false; 
+    
+    if (isScreenDimmed) {
+      setOLEDContrast(maxBrightness); 
+      isScreenDimmed = false;
+      lastActivityTime = currentMillis;
+      ignoreNextRelease = true; 
+      fakeSteps += random(15, 45); 
+    }
+  }
+
+  if (buttonState && buttonHeld && !longPressHandled) {
+    if (currentMillis - buttonPressTime >= 2000) {
+      longPressHandled = true; 
+      lastActivityTime = currentMillis;
+      pendingClick = false; 
+
+      if (isWiFiActive) {
+        // Holding while WiFi is on instantly turns it off!
+        toggleWiFiPortal(false);
+      } else {
+        if (currentScreen == SCREEN_GAME || currentScreen == SCREEN_COIN || currentScreen == SCREEN_STOPWATCH || currentScreen == SCREEN_TEXT) {
+          gameActive = false; coinActive = false; textActive = false;
+          currentScreen = SCREEN_HOME; // Exit Apps
+        } else if (currentScreen == SCREEN_STATUS) {
+          if (!isEditingAOD) {
+            isEditingAOD = true; 
+          } else {
+            isEditingAOD = false;
+            showDoneMessage = true;
+            doneMessageTime = currentMillis;
+            prefs.begin("watch", false);
+            prefs.putBool("aod", isAODEnabled);
+            prefs.end();
+          }
+        } else {
+          toggleWiFiPortal(true); // Turn ON WiFi
+        }
+      }
+    }
+  }
+  
+  if (!buttonState && buttonHeld) {
+    buttonHeld = false;
+    lastActivityTime = currentMillis;
+    
+    if (!longPressHandled) {
+      if (ignoreNextRelease) {
+        ignoreNextRelease = false;
+      } else {
+        // Double Click Lag ONLY applies if we need it
+        bool needsLag = (currentScreen == SCREEN_GAME && !gameActive) || 
+                        (currentScreen == SCREEN_COIN && !coinActive) || 
+                        (currentScreen == SCREEN_STOPWATCH && !swRunning) || 
+                        (currentScreen == SCREEN_TEXT && !textActive);
+
+        if (needsLag) {
+          if (currentMillis - lastButtonReleaseTime < 300 && pendingClick) {
+            clickCount = 2; // Confirmed Double Click
+            pendingClick = false; lastButtonReleaseTime = 0; 
+          } else {
+            pendingClick = true; lastButtonReleaseTime = currentMillis;
+          }
+        } else {
+          clickCount = 1; // Instant single click!
+          lastButtonReleaseTime = currentMillis;
+        }
+      }
+    }
+  }
+
+  // Timer to confirm single click if lag was applied
+  if (pendingClick && (currentMillis - lastButtonReleaseTime > 300)) {
+    clickCount = 1;
+    pendingClick = false;
+  }
+
+  if (clickCount > 0) {
+    if (clickCount == 2) {
+      // --- DOUBLE CLICK EVENT ---
+      if (currentScreen == SCREEN_GAME && !gameActive) {
+        gameActive = true; gameOver = false; score = 0; cactusX = 128; dinoY = 38; dinoVy = 0;
+      } else if (currentScreen == SCREEN_COIN && !coinActive) {
+        coinActive = true; isFlipping = false; showResult = false;
+      } else if (currentScreen == SCREEN_STOPWATCH) {
+        if (!swActive) { swActive = true; swRunning = false; swElapsedTime = 0; }
+        else if (!swRunning) { swElapsedTime = 0; } // Reset Stopwatch
+      } else if (currentScreen == SCREEN_TEXT && !textActive) {
+        textActive = true; currentTextLine = 0; loadTextLines(0); lastTextScrollTime = currentMillis;
+      }
+    } else if (clickCount == 1) {
+      // --- SINGLE CLICK EVENT ---
+      if (isEditingAOD) {
+        isAODEnabled = !isAODEnabled; 
+      } else if (!isWiFiActive) {
+        if (currentScreen == SCREEN_GAME && gameActive) {
+          if (gameOver) { gameOver = false; score = 0; cactusX = 128; dinoY = 38; dinoVy = 0; } 
+          else if (dinoY >= 38) { dinoVy = jumpStrength; }
+        } else if (currentScreen == SCREEN_COIN && coinActive) {
+          if (!isFlipping) { isFlipping = true; showResult = false; flipStartTime = currentMillis; }
+        } else if (currentScreen == SCREEN_STOPWATCH && swActive) {
+          if (swRunning) { 
+            swRunning = false; 
+            swElapsedTime += (lastButtonReleaseTime - swStartTime); 
+          } else { 
+            swRunning = true; 
+            swStartTime = lastButtonReleaseTime; 
+          }
+        } else if (currentScreen == SCREEN_TEXT && textActive) {
+           currentTextLine++; loadTextLines(currentTextLine); lastTextScrollTime = currentMillis;
+        } else {
+          // Cycle through all 10 screens
+          currentScreen = (ScreenState)(((int)currentScreen + 1) % 10); 
+          gameActive = false; coinActive = false; swActive = false; textActive = false;
+        }
+      }
+    }
+    clickCount = 0;
+  }
+
+  if ((currentMillis - lastActivityTime >= displayTimeoutMs) && !isWiFiActive && !swRunning && !isFlipping) {
+    
+    isEditingAOD = false; 
+    showDoneMessage = false;
+
+    if (isAODEnabled) {
+      if (!isScreenDimmed) {
+        setOLEDContrast(aodBrightness); 
+        isScreenDimmed = true;
+      }
+
+      static unsigned long lastAODDraw = 0;
+      if (currentMillis - lastAODDraw >= 1000) {
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_logisoso46_tn); 
+        struct tm timeinfo; getLocalTime(&timeinfo);
+        
+        char hrBuf[4], minBuf[4];
+        snprintf(hrBuf, sizeof(hrBuf), "%02d", timeinfo.tm_hour);
+        snprintf(minBuf, sizeof(minBuf), "%02d", timeinfo.tm_min);
+        
+        u8g2.drawStr(-6, 58, hrBuf);
+        u8g2.drawStr(60, 58, minBuf);
+        u8g2.drawStr(43, 54, ":");
+        
+        u8g2.sendBuffer();
+        lastAODDraw = currentMillis;
+      }
+      
+    } else {
+      u8g2.setPowerSave(1); 
+      currentScreen = SCREEN_HOME; 
+      esp_deep_sleep_start(); 
+    }
+    
+  } else {
+    renderUI();
+  }
+}
